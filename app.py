@@ -1,8 +1,14 @@
 # ─────────────────────────────────────────────
-#  app.py  —  Flask Web Server
+#  app.py  —  Flask Web Server (client-side camera edition)
 # ─────────────────────────────────────────────
 #
-#  Run:
+#  Architecture:
+#    Browser grabs webcam via getUserMedia()
+#    → POSTs JPEG frames to POST /detect
+#    → Server runs YOLO, returns annotated JPEG
+#    → Browser draws result on a <canvas>
+#
+#  Run locally:
 #    python app.py
 #  Then open:
 #    http://127.0.0.1:5000
@@ -10,48 +16,39 @@
 
 from flask import Flask, Response, render_template, jsonify, request
 from detector_web import WebDetector
-import time
 
-app = Flask(__name__)
-
-# Global detector instance (started lazily on first /video_feed request)
+app      = Flask(__name__)
 detector = WebDetector()
-detector.start()   # start immediately so the stream is ready
 
 
-# ── MJPEG frame generator ────────────────────────────────────────────────────
-def _generate_frames():
-    """Yields continuous multipart JPEG frames for the browser."""
-    while True:
-        frame = detector.get_frame()
-        if frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            )
-        else:
-            # Not ready yet — send a tiny sleep so we don't spin-burn CPU
-            time.sleep(0.05)
+# ── Detection endpoint ────────────────────────────────────────────────────────
+
+@app.route("/detect", methods=["POST"])
+def detect():
+    """
+    Accepts a raw JPEG in the request body.
+    Returns the annotated JPEG as image/jpeg.
+    Detection stats are packed into response headers for the JS to read.
+    """
+    jpeg_bytes = request.data
+    if not jpeg_bytes:
+        return "No image data", 400
+
+    out_jpeg, stats = detector.process_frame(jpeg_bytes)
+    if not out_jpeg:
+        return "Failed to process frame", 500
+
+    resp = Response(out_jpeg, mimetype="image/jpeg")
+    # Embed lightweight stats in headers so the JS can read without a
+    # separate /api/stats round-trip
+    resp.headers["X-FPS"]        = str(stats["fps"])
+    resp.headers["X-Total"]      = str(stats["total"])
+    resp.headers["X-Detections"] = str(stats["detections"])  # repr string; JS parses it
+    resp.headers["Access-Control-Expose-Headers"] = "X-FPS, X-Total, X-Detections"
+    return resp
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/video_feed")
-def video_feed():
-    return Response(
-        _generate_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-@app.route("/api/stats")
-def api_stats():
-    return jsonify(detector.get_stats())
-
+# ── Config endpoint ───────────────────────────────────────────────────────────
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
@@ -63,11 +60,18 @@ def api_config():
     return jsonify({"confidence": detector.conf})
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Main page ────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     print("=" * 55)
-    print("  YOLOv8 Device Detector — Web Edition")
+    print("  YOLOv8 Device Detector — Web Edition (client-cam)")
     print("  Open http://127.0.0.1:5000 in your browser")
     print("=" * 55)
-    # threaded=True so the MJPEG stream and API can be served simultaneously
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

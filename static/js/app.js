@@ -1,11 +1,29 @@
 // ─────────────────────────────────────────────
-//  app.js  —  Live Stats & Controls
+//  app.js  —  Client-side camera capture + server YOLO detection
+// ─────────────────────────────────────────────
+//
+//  Flow:
+//    1. Ask browser for webcam via getUserMedia()
+//    2. Every TARGET_INTERVAL_MS:
+//         a. Draw video frame onto hidden captureCanvas
+//         b. Encode to JPEG blob (toBlob)
+//         c. POST blob to /detect
+//         d. Decode response JPEG → draw onto displayCanvas
+//         e. Read X-FPS / X-Total / X-Detections headers → update sidebar
 // ─────────────────────────────────────────────
 
-const POLL_INTERVAL_MS = 800;   // how often to fetch /api/stats (ms)
-const MAX_FPS = 60;    // for the FPS bar fill %
+const TARGET_INTERVAL_MS = 100;  // max ~10 frames/sec sent to server
+const CAPTURE_QUALITY = 0.7;  // JPEG quality for frames sent to server (0–1)
+const MAX_FPS = 30;   // for FPS bar scaling
 
-// DOM refs
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const rawVideo = document.getElementById("rawVideo");
+const captureCanvas = document.getElementById("captureCanvas");
+const displayCanvas = document.getElementById("displayCanvas");
+const camOverlay = document.getElementById("camOverlay");
+const camOverlayTxt = document.getElementById("camOverlayText");
+const startCamBtn = document.getElementById("startCamBtn");
+
 const fpsValueEl = document.getElementById("fpsValue");
 const fpsBarEl = document.getElementById("fpsBar");
 const totalValueEl = document.getElementById("totalValue");
@@ -18,59 +36,153 @@ const classCountEls = {
     "Laptop / Notebook": document.getElementById("cnt-laptop"),
     "Smart Watch": document.getElementById("cnt-watch"),
 };
-
 const classRowEls = {
     "Mobile Phone": document.getElementById("row-phone"),
     "Laptop / Notebook": document.getElementById("row-laptop"),
     "Smart Watch": document.getElementById("row-watch"),
 };
 
-// ── Stats polling ──────────────────────────────────────────────────────────
-async function fetchStats() {
+// ── State ─────────────────────────────────────────────────────────────────────
+let streaming = false;
+let busy = false;   // guard: only one in-flight request at a time
+let loopTimer = null;
+
+// ── Camera init ───────────────────────────────────────────────────────────────
+async function startCamera() {
+    camOverlayTxt.textContent = "Requesting camera access…";
+    startCamBtn.style.display = "none";
+
     try {
-        const res = await fetch("/api/stats");
-        if (!res.ok) return;
-        const data = await res.json();
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "environment" },
+            audio: false,
+        });
 
-        // FPS
-        const fps = data.fps ?? 0;
-        fpsValueEl.textContent = fps.toFixed(1);
-        const pct = Math.min((fps / MAX_FPS) * 100, 100);
-        fpsBarEl.style.width = pct + "%";
+        rawVideo.srcObject = stream;
+        await new Promise(resolve => { rawVideo.onloadedmetadata = resolve; });
 
-        // Update slider gradient to reflect fill
-        const sliderVal = parseFloat(confSlider.value);
-        const sliderPct = ((sliderVal - 0.05) / (0.95 - 0.05)) * 100;
-        confSlider.style.background =
-            `linear-gradient(90deg, var(--cyan) ${sliderPct}%, rgba(255,255,255,0.08) ${sliderPct}%)`;
+        // Size the display canvas to match video
+        const vw = rawVideo.videoWidth || 1280;
+        const vh = rawVideo.videoHeight || 720;
+        captureCanvas.width = vw;
+        captureCanvas.height = vh;
+        displayCanvas.width = vw;
+        displayCanvas.height = vh;
 
-        // Total count
-        const total = data.total ?? 0;
-        totalValueEl.textContent = total;
+        // Hide overlay
+        camOverlay.style.display = "none";
+        streaming = true;
 
-        // Per-class counts
-        const dets = data.detections ?? {};
-        for (const [cls, el] of Object.entries(classCountEls)) {
-            const cnt = dets[cls] ?? 0;
-            el.textContent = cnt;
-            classRowEls[cls].classList.toggle("active", cnt > 0);
-        }
+        // Draw placeholder until first result arrives
+        const ctx = displayCanvas.getContext("2d");
+        ctx.fillStyle = "#0a0a0f";
+        ctx.fillRect(0, 0, vw, vh);
 
-        // Timestamp
-        lastUpdateEl.textContent = new Date().toLocaleTimeString();
+        // Kick off the detection loop
+        scheduleNext();
 
     } catch (err) {
-        // Silently ignore network errors while server is starting
+        console.error("Camera error:", err);
+        camOverlayTxt.textContent = err.name === "NotAllowedError"
+            ? "Camera permission denied. Please allow access and reload."
+            : `Camera error: ${err.message}`;
+        startCamBtn.style.display = "inline-block";
     }
 }
 
-// Start polling
-setInterval(fetchStats, POLL_INTERVAL_MS);
-fetchStats();   // immediate first call
+// ── Detection loop ────────────────────────────────────────────────────────────
+function scheduleNext() {
+    if (!streaming) return;
+    loopTimer = setTimeout(detectFrame, TARGET_INTERVAL_MS);
+}
 
-// ── Confidence Slider ──────────────────────────────────────────────────────
+async function detectFrame() {
+    if (!streaming || busy) { scheduleNext(); return; }
+    busy = true;
 
-// Fetch current config on load
+    try {
+        // 1. Capture frame from hidden video
+        const ctx = captureCanvas.getContext("2d");
+        ctx.drawImage(rawVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+
+        // 2. Encode to JPEG blob
+        const blob = await new Promise(resolve =>
+            captureCanvas.toBlob(resolve, "image/jpeg", CAPTURE_QUALITY)
+        );
+        if (!blob) { busy = false; scheduleNext(); return; }
+
+        // 3. POST to server
+        const res = await fetch("/detect", {
+            method: "POST",
+            headers: { "Content-Type": "image/jpeg" },
+            body: blob,
+        });
+
+        if (!res.ok) { busy = false; scheduleNext(); return; }
+
+        // 4. Read stats from headers
+        const fps = parseFloat(res.headers.get("X-FPS") || "0");
+        const total = parseInt(res.headers.get("X-Total") || "0", 10);
+        const detsRaw = res.headers.get("X-Detections") || "{}";
+
+        // Parse the Python repr dict that comes back, e.g.
+        // "{'Mobile Phone': 1, 'Laptop / Notebook': 2}"
+        let dets = {};
+        try {
+            // Replace single quotes with double quotes for JSON.parse
+            dets = JSON.parse(detsRaw.replace(/'/g, '"'));
+        } catch (_) { }
+
+        // 5. Decode annotated JPEG → draw on display canvas
+        const arrayBuf = await res.arrayBuffer();
+        const imgBlob = new Blob([arrayBuf], { type: "image/jpeg" });
+        const bitmapUrl = URL.createObjectURL(imgBlob);
+        const img = new Image();
+        img.onload = () => {
+            displayCanvas.getContext("2d").drawImage(img, 0, 0);
+            URL.revokeObjectURL(bitmapUrl);
+        };
+        img.src = bitmapUrl;
+
+        // 6. Update sidebar
+        updateStats(fps, total, dets);
+
+    } catch (err) {
+        console.warn("Detection error:", err);
+    }
+
+    busy = false;
+    scheduleNext();
+}
+
+// ── Sidebar updates ───────────────────────────────────────────────────────────
+function updateStats(fps, total, dets) {
+    // FPS
+    fpsValueEl.textContent = fps.toFixed(1);
+    fpsBarEl.style.width = Math.min((fps / MAX_FPS) * 100, 100) + "%";
+
+    // Total objects
+    totalValueEl.textContent = total;
+
+    // Per-class
+    for (const [cls, el] of Object.entries(classCountEls)) {
+        const cnt = dets[cls] ?? 0;
+        el.textContent = cnt;
+        classRowEls[cls].classList.toggle("active", cnt > 0);
+    }
+
+    // Timestamp
+    lastUpdateEl.textContent = new Date().toLocaleTimeString();
+}
+
+// ── Confidence Slider ─────────────────────────────────────────────────────────
+function updateSliderFill() {
+    const val = parseFloat(confSlider.value);
+    const pct = ((val - 0.05) / (0.95 - 0.05)) * 100;
+    confSlider.style.background =
+        `linear-gradient(90deg, var(--cyan) ${pct}%, rgba(255,255,255,0.08) ${pct}%)`;
+}
+
 async function loadConfig() {
     try {
         const res = await fetch("/api/config");
@@ -82,16 +194,7 @@ async function loadConfig() {
     } catch (_) { }
 }
 
-function updateSliderFill() {
-    const val = parseFloat(confSlider.value);
-    const pct = ((val - 0.05) / (0.95 - 0.05)) * 100;
-    confSlider.style.background =
-        `linear-gradient(90deg, var(--cyan) ${pct}%, rgba(255,255,255,0.08) ${pct}%)`;
-}
-
-// Debounced POST to /api/config
 let confTimer = null;
-
 confSlider.addEventListener("input", () => {
     const val = parseFloat(confSlider.value).toFixed(2);
     confDisplay.textContent = val;
@@ -109,22 +212,9 @@ confSlider.addEventListener("input", () => {
     }, 300);
 });
 
-// Reconnect video stream if it stalls (e.g. server restart)
-const videoEl = document.getElementById("videoFeed");
-let videoStallTimer = null;
+// ── Start button (shown if permission denied initially) ───────────────────────
+startCamBtn.addEventListener("click", startCamera);
 
-videoEl.addEventListener("load", () => {
-    clearTimeout(videoStallTimer);
-    startStallWatcher();
-});
-
-function startStallWatcher() {
-    videoStallTimer = setTimeout(() => {
-        // Force reload the src if no new frame arrived in 5 s
-        const src = videoEl.src.split("?")[0];
-        videoEl.src = src + "?t=" + Date.now();
-    }, 5000);
-}
-
-// Init
+// ── Boot ─────────────────────────────────────────────────────────────────────
 loadConfig();
+startCamera();
